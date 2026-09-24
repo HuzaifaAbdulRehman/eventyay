@@ -3,7 +3,7 @@ import calendar
 import logging
 from datetime import datetime
 from datetime import timezone as tz
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Tuple
 
 from zoneinfo import ZoneInfo
@@ -18,7 +18,9 @@ from django.db import DatabaseError
 from django.db.models import Q
 from django_scopes import scopes_disabled
 
+from eventyay.base.decimal import round_decimal
 from eventyay.base.models.vouchers import InvoiceVoucher
+from eventyay.base.operational_logging import OUTCOME_FAILURE, log_event
 from eventyay.helpers.stripe_utils import (
     confirm_payment_intent,
     process_auto_billing_charge_stripe,
@@ -63,12 +65,13 @@ def send_team_webhook(self, user_id, team):
         )
         response.raise_for_status()  # Raise exception for bad status codes
     except requests.RequestException as e:
-        # Log any errors that occur
+        log_event('core', 'connection.post', OUTCOME_FAILURE, error_code='request_error', backend='talk_webhook')
         logger.error('Error sending webhook to talk component: %s', e)
         # Retry the task if an exception occurs (with exponential backoff by default)
         try:
             self.retry(exc=e)
         except self.MaxRetriesExceededError:
+            log_event('core', 'connection.post', OUTCOME_FAILURE, error_code='retries_exhausted', backend='talk_webhook')
             logger.error('Max retries exceeded for sending organizer webhook.')
 
 def get_header_token(user_id):
@@ -189,11 +192,13 @@ def monthly_billing_collect(self):
                 invoice_voucher.save()
 
     except DatabaseError as e:
+        log_event('core', 'connection.collect', OUTCOME_FAILURE, error_code='database_error', backend='billing')
         logger.error('Database error when trying to collect billing: %s', e)
         # Retry the task if an exception occurs (with exponential backoff by default)
         try:
             self.retry(exc=e)
         except self.MaxRetriesExceededError:
+            log_event('core', 'connection.collect', OUTCOME_FAILURE, error_code='retries_exhausted', backend='billing')
             logger.error('Max retries exceeded for billing collect.')
 
 
@@ -241,10 +246,7 @@ def retry_payment(payment_intent_id, organizer_id):
         with scopes_disabled():
             billing_settings = OrganizerBillingModel.objects.filter(organizer_id=organizer_id).first()
             if not billing_settings or not billing_settings.stripe_payment_method_id:
-                logger.error(
-                    'No billing settings or Stripe payment method ID found for organizer %s',
-                    organizer_id,
-                )
+                logger.error('No billing settings or Stripe payment method ID found for organizer %s', organizer_id)
                 return
             confirm_payment_intent(payment_intent_id, billing_settings.stripe_payment_method_id)
             logger.info('Payment confirmed for payment intent: %s', payment_intent_id)
@@ -270,16 +272,10 @@ def process_auto_billing_charge():
             if invoice.final_ticket_fee > 0:
                 billing_settings = OrganizerBillingModel.objects.filter(organizer_id=invoice.organizer_id).first()
                 if not billing_settings or not billing_settings.stripe_customer_id:
-                    logger.error(
-                        'No billing settings or Stripe customer ID found for organizer %s',
-                        invoice.organizer.slug,
-                    )
+                    logger.error('No billing settings or Stripe customer ID found for organizer %s', invoice.organizer.slug)
                     continue
                 if not billing_settings.stripe_payment_method_id:
-                    logger.error(
-                        'No billing settings or Stripe payment method ID found for organizer %s',
-                        invoice.organizer.slug,
-                    )
+                    logger.error('No billing settings or Stripe payment method ID found for organizer %s', invoice.organizer.slug)
                     continue
 
                 metadata = {
@@ -363,6 +359,49 @@ def calculate_ticket_fee(
         return invoice_voucher.limit_events.filter(id=event.id).exists()
 
     ticket_fee = amount * (rate / 100)
+
+    max_fee = None
+    try:
+        from eventyay_business.models import CountryFeeSetting
+    except ImportError:
+        CountryFeeSetting = None
+
+    if CountryFeeSetting is not None:
+        country = event.settings.get('invoice_address_from_country') or event.settings.get('region')
+        if country and event.currency:
+            override = CountryFeeSetting.objects.filter(
+                country=str(country).strip().upper(),
+                currency=str(event.currency).strip().upper(),
+            ).first()
+            if override:
+                ticket_fee = amount * (override.service_fee_percent / Decimal('100.0'))
+                max_fee = round_decimal(override.maximum_fee, currency=event.currency)
+
+    if max_fee is None:
+        gs = GlobalSettingsObject()
+        raw_max_fee = gs.settings.get('ticket_fee_maximum', as_type=Decimal, default=Decimal('0.00'))
+
+        if raw_max_fee and raw_max_fee > Decimal('0.00'):
+            base_currency = getattr(settings, 'DEFAULT_CURRENCY', 'USD')
+            if event.currency and event.currency != base_currency:
+                rates_dict = gs.settings.get('ecb_rates_dict', as_type=dict) or {}
+                if base_currency in rates_dict and event.currency in rates_dict:
+                    rate_conv = (
+                        Decimal(str(rates_dict[event.currency])) / Decimal(str(rates_dict[base_currency]))
+                    ).quantize(Decimal('0.0001'), ROUND_HALF_UP)
+                    max_fee = round_decimal(raw_max_fee * rate_conv, currency=event.currency)
+                else:
+                    logger.warning('ECB rates unavailable for %s→%s; skipping global fee cap for ticket fee calculation.', base_currency, event.currency)
+                    max_fee = Decimal('0.00')
+            else:
+                max_fee = round_decimal(raw_max_fee, currency=event.currency)
+        else:
+            max_fee = Decimal('0.00')
+
+    ticket_fee = round_decimal(ticket_fee, currency=event.currency)
+    if max_fee and max_fee > Decimal('0.00') and ticket_fee > max_fee:
+        ticket_fee = max_fee
+
     final_ticket_fee = ticket_fee
     voucher_discount = Decimal('0.00')
 
@@ -493,18 +532,12 @@ def check_billing_status_for_warning(self):
                 not invoice.last_reminder_datetime or invoice.last_reminder_datetime < reminder_date
             ) and reminder_date <= today:
                 # Send warning email to organizer
-                logger.info(
-                    'Warning email is send to the organizer of %s',
-                    invoice.event.slug,
-                )
+                logger.info('Warning email is send to the organizer of %s', invoice.event.slug)
 
                 # Get organizer's contact details
                 organizer_billing = OrganizerBillingModel.objects.filter(organizer=invoice.organizer).first()
                 if not organizer_billing:
-                    logger.error(
-                        'No billing settings found for organizer %s',
-                        invoice.organizer.name,
-                    )
+                    logger.error('No billing settings found for organizer %s', invoice.organizer.name)
                     break
                 month_name = invoice.monthly_bill.strftime('%B')
 
